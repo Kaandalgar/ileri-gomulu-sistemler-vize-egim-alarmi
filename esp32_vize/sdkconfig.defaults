@@ -1,0 +1,3 @@
+# İşlemci 240 MHz, FreeRTOS tik 1 ms (hassas örnekleme periyodu için)
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+CONFIG_FREERTOS_HZ=1000
