@@ -1,0 +1,15 @@
+﻿# ESP-IDF derleme dosyalari
+**/build/
+**/managed_components/
+**/sdkconfig.old
+
+# Python gecici dosyalari
+**/__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Editor ve sistem dosyalari
+.vscode/
+.DS_Store
+Thumbs.db

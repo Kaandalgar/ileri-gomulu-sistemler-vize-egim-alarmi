@@ -1,10 +1,11 @@
 /*
- * İleri Gömülü Sistemler - Vize şablonu, ESP32-S3 tarafı
+ * İleri Gömülü Sistemler - V1 Eğim Alarmı, klasik ESP32 tarafı
  *
  * MPU-6050'den belirli bir hızda ölçüm alır, UART1 üzerinden metin satırı
  * olarak Raspberry Pi'ye gönderir ve Pi'den gelen komutları işler.
- * Sensör bulunamazsa sentetik veri gönderir; böylece haberleşme sensörsüz
- * de denenebilir.
+ * Gerçek ölçüm modu: sensör yoksa IMU üretilmez, ERR,SENSOR_YOK gönderilir.
+ * Sentetik deneme için Pi tarafındaki sim_esp32.py kullanılır.
+ * Sensör bağlantısı düzeltildikten sonra EN ile yeniden başlatın.
  *
  *   ESP32 -> Pi : $IMU,<zaman_ms>,<ax>,<ay>,<az>,<gx>,<gy>,<gz>*HH
  *   Pi -> ESP32 : $LED,<0|1>*HH      $HIZ,<1..100>*HH
@@ -17,7 +18,6 @@
 #include <string.h>
 #include <stdbool.h>
 #include <inttypes.h>
-#include <math.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "driver/uart.h"
@@ -31,8 +31,8 @@
 #define PIN_TX         17          /* -> Raspberry Pi GPIO15 (RXD, pin 10) */
 #define PIN_RX         18          /* <- Raspberry Pi GPIO14 (TXD, pin 8)  */
 #define BAUD           115200
-#define PIN_SDA        8
-#define PIN_SCL        9
+#define PIN_SDA        21
+#define PIN_SCL        22
 #define PIN_LED        4
 #define MPU_ADR        0x68
 
@@ -79,10 +79,23 @@ static esp_err_t mpu_baslat(void)
     esp_err_t e = i2c_master_transmit_receive(mpu, &reg, 1, &kimlik, 1, 100);
     if (e != ESP_OK) return e;
     ESP_LOGI(TAG, "WHO_AM_I = 0x%02X", kimlik);
-    mpu_yaz(MPU_PWR_MGMT_1, 0x01);     /* uykudan çık, saat: X ekseni PLL */
-    mpu_yaz(MPU_CONFIG, 0x03);         /* sayısal alçak geçiren süzgeç ~44 Hz */
-    mpu_yaz(MPU_GYRO_CONFIG, 0x00);    /* ±250 °/s  -> 131 LSB/(°/s) */
-    return mpu_yaz(MPU_ACCEL_CONFIG, 0x00);   /* ±2 g -> 16384 LSB/g */
+    if (kimlik != 0x68) {
+        /* Modülün üzerinde MPU-6050 yazıyor, ancak kimlik doğrulanmadı.
+         * Ölçümleri ayrı deneylerle değerlendirin; kimliği gizlemeyin. */
+        ESP_LOGW(TAG, "Beklenmeyen sensor kimligi: 0x%02X (MPU-6050: 0x68); model dogrulanmadi",
+                 kimlik);
+    }
+    e = mpu_yaz(MPU_PWR_MGMT_1, 0x01);
+    if (e != ESP_OK) return e;
+    vTaskDelay(pdMS_TO_TICKS(100));  /* uyanış ve ilk ölçüm için bekle */
+    e = mpu_yaz(MPU_CONFIG, 0x03);
+    if (e != ESP_OK) return e;
+    e = mpu_yaz(MPU_GYRO_CONFIG, 0x00);
+    if (e != ESP_OK) return e;
+    e = mpu_yaz(MPU_ACCEL_CONFIG, 0x00);
+    if (e != ESP_OK) return e;
+    vTaskDelay(pdMS_TO_TICKS(100));
+    return ESP_OK;
 }
 
 /* v: ax, ay, az, gx, gy, gz (ham değerler) */
@@ -98,15 +111,6 @@ static esp_err_t mpu_oku(int16_t v[6])
     return ESP_OK;                     /* d[6], d[7]: sıcaklık, kullanılmıyor */
 }
 
-static void sentetik_veri(int16_t v[6], uint32_t sayac)
-{
-    float t = sayac * (periyot_ms / 1000.0f);
-    v[0] = (int16_t)(4000.0f * sinf(2.0f * (float)M_PI * 1.0f * t));
-    v[1] = (int16_t)(2000.0f * cosf(2.0f * (float)M_PI * 0.5f * t));
-    v[2] = 16384;                      /* 1 g */
-    v[3] = v[4] = v[5] = 0;
-}
-
 static void olcum_gorevi(void *arg)
 {
     TickType_t son = xTaskGetTickCount();
@@ -115,20 +119,27 @@ static void olcum_gorevi(void *arg)
     char govde[96];
 
     while (1) {
+        if (!sensor_var) {
+            gpio_set_level(PIN_LED, 0);
+            satir_gonder("ERR,SENSOR_YOK");
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
         bool gecerli = true;
         if (sensor_var) {
             if (mpu_oku(v) != ESP_OK) {
                 satir_gonder("ERR,I2C");
                 gecerli = false;
             }
-        } else {
-            sentetik_veri(v, sayac);
         }
         if (gecerli) {
             snprintf(govde, sizeof(govde), "IMU,%" PRIu32 ",%d,%d,%d,%d,%d,%d",
                      (uint32_t)(esp_timer_get_time() / 1000),
                      v[0], v[1], v[2], v[3], v[4], v[5]);
             satir_gonder(govde);
+            if (sayac % 50 == 0) {
+                ESP_LOGI(TAG, "HAM ax=%d ay=%d az=%d", v[0], v[1], v[2]);
+            }
         }
         sayac++;
         xTaskDelayUntil(&son, pdMS_TO_TICKS(periyot_ms));
@@ -231,7 +242,11 @@ void app_main(void)
         ESP_ERROR_CHECK(i2c_master_bus_add_device(bus, &dcfg, &mpu));
         sensor_var = (mpu_baslat() == ESP_OK);
     }
-    ESP_LOGI(TAG, "%s", sensor_var ? "MPU-6050 bulundu" : "Sensör yok: sentetik veri gönderilecek");
+    if (sensor_var) {
+        ESP_LOGI(TAG, "GERCEK OLCUM: I2C sensoru hazir; sentetik veri KAPALI");
+    } else {
+        ESP_LOGE(TAG, "SENSOR HATASI: IMU gonderilmiyor; ERR,SENSOR_YOK. Baglantiyi kontrol edip EN ile yeniden baslatin.");
+    }
 
     xTaskCreate(alma_gorevi, "alma", 4096, NULL, 6, NULL);
     xTaskCreate(olcum_gorevi, "olcum", 4096, NULL, 5, NULL);
